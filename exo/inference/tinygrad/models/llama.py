@@ -1,6 +1,10 @@
 from typing import Tuple, Union, Optional, Dict, Any
 from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device
 from tinygrad.helpers import getenv
+from dataclasses import dataclass, field
+from ...shard import Shard
+
+from exo.inference.tinygrad.sharded_utils import BaseModelArgs
 
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
@@ -36,6 +40,34 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
   # NOTE: this is different from x.repeat((1, 1, n_rep, 1))
   return x.repeat((1, 1, 1, n_rep)).reshape(bs, seqlen, n_kv_heads*n_rep, head_dim)
 
+
+@dataclass
+class ModelArgs(BaseModelArgs):
+  model_type: str
+  hidden_size: int
+  num_hidden_layers: int
+  intermediate_size: int
+  num_attention_heads: int
+  rms_norm_eps: float
+  vocab_size: int
+  head_dim: Optional[int] = None
+  max_position_embeddings: Optional[int] = None
+  num_key_value_heads: Optional[int] = None
+  attention_bias: bool = False
+  mlp_bias: bool = False
+  rope_theta: float = 10000
+  rope_traditional: bool = False
+  rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+  tie_word_embeddings: bool = True
+  shard: Shard = field(default_factory=lambda: Shard("", 0, 0, 0))
+
+  def __post_init__(self):
+    if isinstance(self.shard, Shard):
+      return
+    if not isinstance(self.shard, dict):
+      raise TypeError(f"Expected shard to be a Shard instance or a dict, got {type(self.shard)} instead")
+
+    self.shard = Shard(**self.shard)
 
 class Attention:
   def __init__(self, dim, n_heads, n_kv_heads, max_context, linear=nn.Linear):
@@ -164,28 +196,20 @@ from exo.inference.shard import Shard
 class Transformer:
   def __init__(
     self,
-    dim: int,
-    hidden_dim: int,
-    n_heads: int,
-    n_layers: int,
-    norm_eps: float,
-    vocab_size,
-    shard: Shard = None,
+    args: ModelArgs,
     linear=nn.Linear,
-    n_kv_heads=None,
-    rope_theta=10000,
     max_context=1024,
     jit=True,
-    feed_forward=FeedForward
+    feed_forward=FeedForward,
   ):
-    self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear, feed_forward=feed_forward) for _ in range(n_layers)]
-    self.norm = nn.RMSNorm(dim, norm_eps)
-    self.tok_embeddings = nn.Embedding(vocab_size, dim)
-    self.output = nn.Linear(dim, vocab_size, bias=False)
+    self.layers = [TransformerBlock(args.hidden_size, args.intermediate_size, args.num_attention_heads, args.num_key_value_heads, args.rms_norm_eps, max_context, linear, feed_forward=feed_forward) for _ in range(args.num_hidden_layers)]
+    self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
+    self.tok_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
+    self.output = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
     self.max_context = max_context
-    self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context*2, rope_theta).contiguous()
+    self.freqs_cis = precompute_freqs_cis(args.hidden_size // args.num_attention_heads, self.max_context*2, args.rope_theta).contiguous()
     self.forward_jit = TinyJit(self.forward) if jit else None
-    self.shard = shard
+    self.shard = args.shard
 
   def forward(self, x: Tensor, start_pos: Union[Variable, int], temperature: float, top_k: int, top_p: float, alpha_f: float, alpha_p: float):
     seqlen = x.shape[1]

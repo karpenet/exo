@@ -13,6 +13,9 @@ from exo.inference.tinygrad.tinygrad_helpers import concat_weights, load
 from exo.download.shard_download import ShardDownloader
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import logging
+import importlib
+
 
 Tensor.no_grad = True
 # default settings
@@ -26,12 +29,47 @@ MODEL_PARAMS = {
   "70B": {"args": {"dim": 8192, "n_heads": 64, "n_kv_heads": 8, "n_layers": 80, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 28672}, "files": 8}
 }
 
+def load_config(model_path: Path) -> dict:
+  try:
+    with open(model_path/"config.json", "r") as f:
+      config = json.load(f)
+  except FileNotFoundError:
+    logging.error(f"Config file not found in {model_path}")
+    raise
+  return config
+
+def _get_classes(config: dict):
+  """
+  Retrieve the model and model args classes based on the configuration.
+
+  Args:
+   config (dict): The model configuration.
+
+  Returns:
+   A tuple containing the Model class and the ModelArgs class.
+  """
+  model_type = config["model_type"]
+  try:
+    arch = importlib.import_module(f"exo.inference.tinygrad.models.{model_type}")
+  except ImportError:
+    msg = f"Model type {model_type} not supported."
+    logging.error(msg)
+    raise ValueError(msg)
+
+  return arch.Transformer, arch.ModelArgs
 
 def build_transformer(model_path: Path, shard: Shard, model_size="8B", device=None):
   # build model
   linear = nn.Linear
+  config = load_config(model_path)
+  model_class, model_args_class = _get_classes(config)
+  model_args = model_args_class.from_dict(config)
+
+#   import ipdb; ipdb.set_trace()
+     
   with Context(THREEFRY=0):
-    model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, max_context=8192, jit=True, shard=shard)
+    # model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, max_context=8192, jit=True, shard=shard)
+    model = model_class(model_args)
 
   # load weights
   if model_path.is_dir():
